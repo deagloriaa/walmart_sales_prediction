@@ -1,0 +1,455 @@
+---
+title: "Sales Prediction - Supervised Learning (Regression and Classification)"
+author: '200618113'
+date: '2023-03-01'
+output:
+  pdf_document: default
+  html_document: default
+knit: rmarkdown::render
+---
+
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(psych)
+library(caTools)
+library(MASS)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(class)
+library(e1071)
+library(caret)
+library(randomForest)
+```
+
+```{r}
+# Reading the dataset
+df <- read.csv("https://raw.githubusercontent.com/deagloriaa/walmart_sales_prediction/main/Walmart.csv")
+head(df)
+```
+# Exploratory Data Analysis
+```{r}
+# Taking a further look on the dataset
+summary(df)
+```
+There does not seem to be any missing values.
+```{r}
+glimpse(df)
+```
+However, we will change the data types of 'Date' and 'Holiday Flag' appropriately.
+```{r}
+df$Holiday_Flag <- factor(df$Holiday_Flag)
+df$Date <- as.Date(df$Date, "%d-%m-%Y")
+```
+
+Checking the null values and duplicated observations
+```{r}
+paste("There are", sum(duplicated(df)), "duplicated observation(s) in the dataset")
+paste("There are", sum(is.na(df)), "null observation(s) in the dataset")
+```
+The data is good to go.
+
+```{r}
+# Relocating the Weekly_Sales and Holiday_Flag column for convenience
+df <- df %>% relocate(Weekly_Sales, .before = Store) %>% relocate(Holiday_Flag, .after = Weekly_Sales)
+```
+
+```{r}
+# Feature Engineering on Date
+
+df <- df %>%
+  mutate(Day = as.integer(substr(Date, 9, 10)),
+         Month = as.integer(substr(Date, 6, 7)),
+         Year = as.integer(substr(Date, 1, 4)))
+```
+
+```{r}
+# Plotting correlation between the variables
+pairs.panels(df, 
+             method = "pearson",
+             hist.col = "#0048BB",
+             density = TRUE,
+             ellipses = TRUE
+)
+```
+Only fuel price that has a correlation to date/year. However, the independent variables does not seem to have a high correlation with the targeted variable - Weekly_Sales.
+
+
+```{r}
+# Plotting the distribution of the target variable, Weekly Sales
+
+ggplot(df, aes(x = Weekly_Sales)) +
+  geom_boxplot() +
+  theme_bw() +
+  ggtitle("Distribution of Weekly Sales") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_x_continuous(labels = scales::label_comma())
+```
+The data is right-skewed distributed. This can be seen based on the outliers on the right hand side.
+
+
+```{r}
+# Checking on the outliers
+
+head(df$Weekly_Sales[df$Weekly_Sales > 1.5 * (quantile(df$Weekly_Sales, 0.75) - quantile(df$Weekly_Sales, 0.25))])
+```
+The outlier seems to be natural outliers. Hence we do not need to remove the outliers as it may actually help us in predicting extreme cases.
+```{r}
+# Avg Weekly Sales across Stores
+ggplot(df, aes(x = Weekly_Sales, y = reorder(as.factor(Store),
+                                             FUN = mean, Weekly_Sales))) +
+  geom_boxplot() +
+  theme_minimal() +
+  xlab("Mean of Weekly Sales") +
+  ylab("Nth Store") +
+  ggtitle("Mean of Weekly Sales Across Different Stores") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_x_continuous(labels = scales::label_comma())
+```
+
+```{r}
+# Weekly Sales on Holidays vs. Non-Holidays
+ggplot(df, aes(x = Holiday_Flag, y = Weekly_Sales, fill = Holiday_Flag)) +
+  geom_boxplot() +
+  theme_bw() +
+  scale_y_continuous(labels = scales::label_comma()) +
+  xlab("") +
+  ylab("Weekly Sales") +
+  ggtitle("Comparison of Weekly Sales\nduring Holidays vs. Non-Holidays") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "None") +
+  scale_x_discrete(labels = c("0" = "Non-Holidays", "1" = "Holidays"))
+```
+
+```{r}
+# Average Weekly Sales by Date of Week
+df %>%
+  group_by(Date) %>%
+  summarize(avg_weekly_sales = mean(Weekly_Sales)) %>%
+  ggplot(aes(x = Date, y = avg_weekly_sales)) +
+  geom_line(color = "#5A5A5A") +
+  geom_point(aes(color = avg_weekly_sales > 1200000), show.legend = FALSE) +
+  theme_classic() +
+  ggtitle("Average Weekly Sales by Date") +
+  xlab("") +
+  ylab("Average Weekly Sales") +
+  scale_x_date(date_breaks = "3 months") +
+  scale_y_continuous(labels = scales::label_comma()) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Retrieving the maximum and minimum average weekly sales
+a <- df %>%
+  group_by(Date) %>%
+  summarize(avg_weekly_sales = mean(Weekly_Sales)) %>%
+  arrange(desc(avg_weekly_sales))
+
+(max_avg <- max(a$avg_weekly_sales))
+(min_avg <- min(a$avg_weekly_sales))
+(med_avg <- median(a$avg_weekly_sales))
+(avg_avg <- mean(a$avg_weekly_sales))
+```
+
+# Data Preparation
+```{r}
+# Removing the Date column as it now overlaps
+df <- df %>%
+  dplyr::select(-Date,)
+```
+
+```{r}
+## Train-Test Splitting for Regression
+set.seed(3189)
+
+sample <- sample.split(df$Weekly_Sales, SplitRatio = 0.7)
+train <- subset(df, sample == TRUE)
+test  <- subset(df, sample == FALSE)
+```
+
+# I. Regression Task
+## 1. Linear Regression
+```{r}
+sales_lm1 <- lm(Weekly_Sales ~ ., data = train)
+summary(sales_lm1)
+```
+
+```{r}
+# Plotting diagnostic plot
+par(mfrow = c(2,2))
+plot(sales_lm1)
+par(mfrow = c(1,1))
+```
+The diagnostic plot seems to be normal on all aspects. We will proceed with backward elimination to choose only the significant variables for the multiple linear regression model.
+```{r}
+# Selecting only important variables using the step backward elimination, retrieving lowest AIC
+sales_lm2 <- step(sales_lm1, direction = "backward")
+summary(sales_lm2)
+```
+It turns out that Store, Temperature, CPI, Unemployment, and Month are the significant predictors in predicting Weekly Sales.
+
+```{r}
+par(mfrow = c(2,2))
+plot(sales_lm2)
+par(mfrow = c(1,1))
+```
+The diagnostic plot looks good to go! Continue with model prediction using test set.
+```{r}
+# Predict the model using test set
+predict_lm <- predict(sales_lm2, newdata = test)
+lm_test_error <- test$Weekly_Sales - predict_lm
+(RMSE_lm <- sqrt(mean(lm_test_error^2)))
+```
+## 2. Regularized Linear Regression
+```{r}
+# create range of lambda to be investigated
+grid <- 10^seq(10,-2, length = 100)
+```
+
+```{r}
+# Converting the independent and dependent variables as matrix as required by glmnet
+# We are going to use predictors that are significant based on linear model 2.
+x <- data.matrix(df %>% dplyr::select(Store, Temperature, CPI, Unemployment, Month))
+y <- data.matrix(df$Weekly_Sales)
+
+x_train <- data.matrix(train %>% dplyr::select(Store, Temperature, CPI, Unemployment, Month))
+y_train <- data.matrix(train$Weekly_Sales)
+
+x_test <- data.matrix(test %>% dplyr::select(Store, Temperature, CPI, Unemployment, Month))
+y_test <- data.matrix(test$Weekly_Sales)
+```
+
+
+### a. Ridge Regression
+```{r}
+# Train the algorithm
+ridge_mod <- glmnet(alpha = 0, x = x_train, y = y_train, lambda = grid)
+cv_out <- cv.glmnet(x = x_train, y = y_train, alpha = 0)
+cv_out
+```
+
+```{r}
+# Choose the best lambda that balances the bias-variance trade-off
+(best_lambda <- cv_out$lambda.min)
+```
+
+```{r}
+# Predict the model using test set
+predict_ridge <- predict(ridge_mod, s = best_lambda, newx = x_test)
+(RMSE_ridge <- sqrt(mean((predict_ridge - y_test)^2)))
+```
+
+```{r}
+# Ridge coefficients
+ridge_output <- glmnet(x, y, alpha = 0, lambda = grid)
+(ridge_coef <- predict(ridge_output, type = "coefficients", s = best_lambda))
+```
+Continue to redo the same process with LASSO Regression
+
+### b. LASSO Regression
+```{r}
+lasso_mod <- glmnet(alpha = 1, x = x_train, y = y_train, lambda = grid)
+cv_out <- cv.glmnet(x = x_train, y = y_train, alpha = 0)
+cv_out
+```
+
+```{r}
+(best_lambda <- cv_out$lambda.min)
+```
+
+```{r}
+predict_lasso <- predict(lasso_mod, s = best_lambda, newx = x_test)
+(RMSE_lasso <- sqrt(mean((predict_lasso - y_test)^2)))
+```
+
+```{r}
+lasso_output <- glmnet(x, y, alpha = 1, lambda = grid)
+(lasso_coef <- predict(lasso_output, type = "coefficients", s = best_lambda))
+```
+
+## 3. Decision Tree (CART)
+```{r}
+# Step 1: Grow tree to the max
+cart_mod <- rpart(Weekly_Sales ~ ., data = train, method = "anova", control = rpart.control(minsplit = 2, cp = 0))
+# cart_mod # run to see the splitting details
+# printcp(cart_mod, digits = 3) # run to see the CP
+
+# From printcp, variables actually used in tree construction are: CPI, Day, Fuel_Price, Holiday_Flag, Month, Temperature, Unemployment, Year
+```
+
+```{r}
+# Step 2: Prune tree
+cp_min <- cart_mod$cptable[which.min(cart_mod$cptable[,"xerror"]),"CP"]
+cart_mod_pruned <- prune(cart_mod, cp = cp_min)
+# printcp(cart_mod_pruned, digits = 3)
+# plotcp(cart_mod_pruned)
+rpart.plot(cart_mod_pruned, nn = T, main = "Decision Tree Model for Regression")
+```
+
+```{r}
+# Checking variable importance
+cart_mod_pruned$variable.importance # In descending order already
+```
+
+```{r}
+# Create model prediction and retrieve RMSE
+predict_cart <- predict(cart_mod_pruned, newdata = test)
+(RMSE_cart <- sqrt(mean((test$Weekly_Sales - predict_cart)^2)))
+```
+## 4. Random Forest
+```{r}
+rf_mod <- randomForest(Weekly_Sales ~ ., data = train, mtry = floor(ncol(df)/3), ntree = 500, importance = T)
+rf_mod
+```
+
+```{r}
+(var_imp <- importance(rf_mod))
+#varImpPlot(rf_mod, 1)
+```
+
+```{r}
+predict_rf <- predict(rf_mod, newdata = test)
+(RMSE_rf <- sqrt(mean((test$Weekly_Sales - predict_rf)^2)))
+```
+
+```{r}
+## Comparing the Performance of Regression Models
+RMSE_table <- data.frame("RMSE" = 1:5)
+rownames(RMSE_table) <- c("Linear Regression", "Ridge Regression", "Lasso Regression", "Decision Tree", "Random Forest")
+
+RMSE_table[1,1] <- RMSE_lm
+RMSE_table[2,1] <- RMSE_ridge
+RMSE_table[3,1] <- RMSE_lasso
+RMSE_table[4,1] <- RMSE_cart
+RMSE_table[5,1] <- RMSE_rf
+```
+
+```{r}
+RMSE_table
+```
+# II. Classification Task
+```{r}
+# Creating a column called "Class_Sales" for the target classification
+# If it is above median, it is classified as high sales, vice versa
+df$Class_Sales <- ifelse(df$Weekly_Sales > median(df$Weekly_Sales), 1, 0) %>%
+  factor()
+```
+
+```{r}
+## Train-Test Splitting for Classification
+set.seed(3189)
+
+sample <- sample.split(df$Class_Sales, SplitRatio = 0.7)
+train <- subset(df, sample == TRUE)
+test  <- subset(df, sample == FALSE)
+```
+
+## 1. Logistic Regression
+```{r}
+# Train the model
+logreg_mod <- glm(Class_Sales ~ Store + Temperature + CPI + Unemployment + Month, data = train, family = "binomial")
+summary(logreg_mod)
+```
+
+```{r}
+(OR <- exp(coef(logreg_mod))) # Odds Ratio
+(OR_CI <- exp(confint(logreg_mod))) # Odds Ratio Confidence Interval
+
+pred_logreg <- predict(logreg_mod, newdata = test, type = "response")
+(logreg_performance <- confusionMatrix(data = as.factor(as.numeric(pred_logreg > 0.5)), reference = as.factor(test$Class_Sales)))
+```
+## 2. Support Vector Machine
+```{r}
+svm_mod <- svm(Class_Sales ~ Store + Temperature + Fuel_Price + CPI + Unemployment + Month, data = train, 
+               type = 'C-classification', kernel = "radial", gamma = 1, cost = 1)
+```
+
+```{r}
+pred_svm <- predict(svm_mod, test)
+(svm_performance <- confusionMatrix(data = pred_svm, reference = as.factor(test$Class_Sales)))
+```
+## 3. K-Nearest Neighbor
+```{r}
+knn_mod <- knn(train, test, cl = train$Class_Sales, k = sqrt(nrow(df)))
+
+pred <- as.factor(knn_mod)
+(knn_performance <- confusionMatrix(data = pred, reference = as.factor(test$Class_Sales)))
+```
+## 4. Decision Tree (CART)
+```{r}
+cart_mod_1 <- rpart(Class_Sales ~ . -Weekly_Sales, data = train, method = "class", control = rpart.control(minsplit = 2, cp = 0))
+
+#printcp(cart_mod_1, digits = 3)
+#plotcp(cart_mod_1)
+```
+
+```{r}
+cp_min <- cart_mod_1$cptable[which.min(cart_mod_1$cptable[,"xerror"]),"CP"]
+cart_mod_2 <- prune(cart_mod_1, cp = cp_min)
+#printcp(cart_mod_2, digits = 3)
+#plotcp(cart_mod_2)
+rpart.plot(cart_mod_2, nn = T, main = "Decision Tree Model for Classification")
+```
+
+```{r}
+cart_mod_2$variable.importance # The variable importance are in descending order
+
+# Predicting the model
+predict_cart <- predict(cart_mod_2, newdata = test, type = 'class')
+(cart_performance <- confusionMatrix(data = predict_cart, reference = as.factor(test$Class_Sales)))
+```
+## 5. Random Forest
+```{r}
+rf_mod <- randomForest(Class_Sales ~ . -Weekly_Sales, data = train, mtry = floor(sqrt(ncol(df))), ntree = 500, importance = T)
+rf_mod
+```
+
+```{r}
+(var_imp <- importance(rf_mod))
+#varImpPlot(rf_mod, 1)
+```
+
+```{r}
+predict_rf <- predict(rf_mod, newdata = test)
+(rf_performance <- confusionMatrix(data = predict_rf, reference = as.factor(test$Class_Sales)))
+```
+## Performance Comparison Table
+```{r}
+perf_table <- data.frame("Balanced Accuracy" = 1:5, "Sensitivity_Recall" = 1:5, "Specificity" = 1:5,  "Precision" = 1:5)
+rownames(perf_table) <- c("Logistic Regression", "Support Vector Machine", "K-Nearest Neighbor", "Decision Tree", "Random Forest")
+```
+
+```{r}
+perf_table[1,1] <- logreg_performance$byClass["Balanced Accuracy"]
+perf_table[2,1] <- svm_performance$byClass["Balanced Accuracy"]
+perf_table[3,1] <- knn_performance$byClass["Balanced Accuracy"]
+perf_table[4,1] <- cart_performance$byClass["Balanced Accuracy"]  
+perf_table[5,1] <- rf_performance$byClass["Balanced Accuracy"]
+
+perf_table[1,2] <- logreg_performance$byClass["Sensitivity"]
+perf_table[2,2] <- svm_performance$byClass["Sensitivity"]
+perf_table[3,2] <- knn_performance$byClass["Sensitivity"]
+perf_table[4,2] <- cart_performance$byClass["Sensitivity"]
+perf_table[5,2] <- rf_performance$byClass["Sensitivity"]
+  
+perf_table[1,3] <- logreg_performance$byClass["Specificity"]
+perf_table[2,3] <- svm_performance$byClass["Specificity"]
+perf_table[3,3] <- knn_performance$byClass["Specificity"]
+perf_table[4,3] <- cart_performance$byClass["Specificity"]
+perf_table[5,3] <- rf_performance$byClass["Specificity"]
+
+perf_table[1,4] <- logreg_performance$byClass["Precision"]
+perf_table[2,4] <- svm_performance$byClass["Precision"]
+perf_table[3,4] <- knn_performance$byClass["Precision"]
+perf_table[4,4] <- cart_performance$byClass["Precision"]
+perf_table[5,4] <- rf_performance$byClass["Precision"]
+```
+
+```{r}
+perf_table
+```
